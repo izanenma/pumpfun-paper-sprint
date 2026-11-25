@@ -8,11 +8,12 @@ A paper-trading bot for make.fun's [Pump.fun Paper Sprint: Any Bot Can Win](http
 
 ## Strategy
 
-Most pump.fun coins spike hard in their first minute and then bleed back to their creation price, and a bonding-curve price can never fall far below that creation price. So the bot buys early and small, adds only while a coin keeps rising on real buying, and lets a small part of every position ride for the rare coin that runs to completion (~14.7x its creation price).
+Most pump.fun coins spike hard in their first minute and then bleed back to their creation price, and a bonding-curve price can never fall far below that creation price. So the bot buys the floor after the spike: a coin that ran and came back has shown real demand, and buying it near its creation price caps the downside while a second leg or a run to completion pays many times the stake.
 
-- **Probe:** 0.01 SOL into a new coin as soon as its real reserve reaches 1 SOL, the coin is at most 60 slots old, and the batch shows real demand (the creator bought at least 0.5 SOL, or the batch's buys total at least 0.5 SOL).
-- **Add:** while a held coin is at most 180 slots old, its price is at least 15% above our blended entry, and the last 30 slots bought more than they sold, add up to 1% of its real reserve, at most 0.15 SOL invested per coin in total.
-- **Exit:** sell 40% of the tokens at +30% over the blended entry, then 50% of what is left at +70%. The rest is a moonbag: it only leaves on a 25% pullback from its peak, on a 10% stop below entry, or after about 16 minutes below +10%.
+- **Probe:** 0.01 SOL into a coin that spiked at least 12% above its creation price and has since fallen back to within 10% of it, while it is 60 to 1200 slots old and its real reserve is at least 1 SOL.
+- **Exit:** sell 40% of the tokens at +30% over the blended entry, then 50% of what is left at +80%. The rest is a moonbag: it only leaves on a 30% pullback from its peak, on a 3% stop below entry, or after about 24 minutes below +10%.
+
+Everything is deterministic: no clock, no randomness, no environment, no network. The bot speaks the `agent-fun/replay/v2` protocol on stdin/stdout through the `vendor/makefun-bot.ts` shim (the kit's own SDK, copied unchanged).
 
 Everything is deterministic: no clock, no randomness, no environment, no network. The bot speaks the `agent-fun/replay/v2` protocol on stdin/stdout through the `vendor/makefun-bot.ts` shim (the kit's own SDK, copied unchanged).
 

@@ -1,26 +1,21 @@
 // Pump.fun Paper Sprint bot: probe + pyramid momentum sniper.
 //
 // The harness sends a hello first, then one batch per slot; every batch
-// carries events and fills, and we answer with orders. The whole game is
-// the first minute after a coin is created: most coins spike hard in their
-// first slots and then bleed back to their creation price, and the price
-// can never fall far below that creation price (a bonding curve only gives
-// back what buyers put in), so the edge is to buy early and small, add
-// only while the coin keeps rising on real buying, and let a small part
-// of every position ride for the rare coin that runs to completion.
+// carries events and fills, and we answer with orders. Most coins spike
+// hard in their first minute and then bleed back to their creation price,
+// and the price can never fall far below that creation price (a bonding
+// curve only gives back what buyers put in), so the edge is to buy the
+// floor after the spike: a coin that ran and came back has shown real
+// demand, and buying it near its creation price caps the downside while
+// a second leg or a run to completion pays many times the stake.
 //
 // Rules, all deterministic (no clock, no randomness, no environment):
-//   - Probe: 0.01 SOL into a new coin as soon as its real reserve reaches
-//     1 SOL (the size cap then allows a 0.01 SOL buy), the coin is at most
-//     60 slots old, and the batch shows real demand (the creator bought at
-//     least 0.5 SOL, or the batch's buys total at least 0.5 SOL).
-//   - Add: while a held coin is at most 180 slots old, its price is at
-//     least 15% above our blended entry, and the last 30 slots bought more
-//     than they sold, add up to 1% of its real reserve, at most 0.15 SOL
-//     invested per coin in total. We scale into strength, never into a fall.
-//   - Exit: sell 40% of the tokens at +30% over the blended entry, then
-//     50% of what is left at +70%. The rest is a moonbag: it only leaves
-//     on a 25% pullback from its peak, on a 10% stop below entry, or after
+//   - Probe: 0.01 SOL into a coin that spiked at least 15% above its
+//     creation price and has since fallen back to within 8% of it, while
+//     it is 60 to 900 slots old and its real reserve is at least 1 SOL.
+//   - Exit: sell 50% of the tokens at +15% over the blended entry, then
+//     50% of what is left at +40%. The rest is a moonbag: it only leaves
+//     on a 30% pullback from its peak, on a 3% stop below entry, or after
 //     2400 slots (about 16 minutes) below +10%. A coin that completes is
 //     closed by the harness itself at roughly 14.7x its creation price.
 
@@ -33,20 +28,23 @@ import {
 } from "./vendor/makefun-bot.ts";
 
 const SOL = LAMPORTS_PER_SOL;
-const PROBE_LAMPORTS = 10_000_000n; // 0.01 SOL: the smallest round trip that counts
-const MAX_PER_MINT_LAMPORTS = 150_000_000n; // 0.15 SOL invested per coin, at most
-const PROBE_MAX_AGE_SLOTS = 60;
+const PROBE_LAMPORTS = 10_000_000n; // 0.01 SOL: the smallest round trip that counts (v4c's scaled probe made the slightly negative per-coin edge worse in total)
+const MAX_PER_MINT_LAMPORTS = 10_000_000n; // probe only, no adds (adds bought the top of spikes and made the bleed worse)
+const PROBE_MIN_AGE_SLOTS = 60; // v4e: wait for the spike to dump back first
+const PROBE_MAX_AGE_SLOTS = 1200; // v4e: about 8 minutes after creation (middle ground: enough coins for the 20-mint bar, fewer fees than v4b)
+const DUMP_MAX_BPS = 1000; // v4e: buy back within 10% of the creation price
+const SPIKE_MIN_BPS = 1200; // v4e: the coin must have spiked at least 12% first
 const ADD_MAX_AGE_SLOTS = 180;
 const ADD_MIN_GAIN_BPS = 1500; // add only 15% above our blended entry
 const WINDOW_SLOTS = 30; // momentum window for adds
-const TP1_BPS = 3000; // +30%: sell 40% of the tokens held
-const TP2_BPS = 7000; // +70%: sell 50% of the tokens still held
-const STOP_BPS = 1000; // -10% below the blended entry: sell everything
-const TRAIL_BPS = 2500; // 25% below the peak: sell the moonbag
-const TIMEOUT_SLOTS = 2400; // about 16 minutes: sell a stale position
+const TP1_BPS = 3000; // v4d: +30%: sell 40% of the tokens held (hold more for the second leg)
+const TP2_BPS = 8000; // v4d: +80%: sell 50% of the tokens still held
+const STOP_BPS = 300; // -3% below the blended entry: sell everything
+const TRAIL_BPS = 3000; // 30% below the peak: sell the moonbag
+const TIMEOUT_SLOTS = 3600; // v4d: about 24 minutes: give the second leg more time
 const BUY_SLIPPAGE_BPS = 2000;
 const SELL_SLIPPAGE_BPS = 5000;
-const CREATOR_PROBE_LAMPORTS = 500_000_000n; // 0.5 SOL of creator buying
+const CREATOR_PROBE_LAMPORTS = 500_000_000n; // 0.5 SOL of creator buying (v5: back to the wide filter, more coins for completions)
 const BATCH_PROBE_LAMPORTS = 500_000_000n; // 0.5 SOL of buys in one batch
 const MIN_REAL_RESERVE_LAMPORTS = 1_000_000_000n; // 1 SOL of real reserve
 
@@ -60,12 +58,14 @@ interface Coin {
   mint: string;
   createdSlot: number;
   creator: string;
+  createPrice: number;
   creatorBuyLamports: bigint;
   probed: boolean;
   investedLamports: bigint;
   peakPrice: number;
   tp1Done: boolean;
   tp2Done: boolean;
+  lastSellRejectSlot: number;
   flows: SlotFlow[];
 }
 
@@ -107,16 +107,19 @@ function noteEvents(state: BotState, batch: Batch): Map<string, { buy: bigint; s
   for (const event of batch.events) {
     if (event.event === "CreateEvent") {
       if (!coins.has(event.mint)) {
+        const createPrice = priceOf(BigInt(event.virtual_quote_reserves), BigInt(event.virtual_token_reserves));
         coins.set(event.mint, {
           mint: event.mint,
           createdSlot: event.slot,
           creator: event.creator,
+          createPrice,
           creatorBuyLamports: 0n,
           probed: false,
           investedLamports: 0n,
-          peakPrice: 0,
+          peakPrice: createPrice,
           tp1Done: false,
           tp2Done: false,
+          lastSellRejectSlot: -1000000,
           flows: [],
         });
       }
@@ -131,6 +134,8 @@ function noteEvents(state: BotState, batch: Batch): Map<string, { buy: bigint; s
         if (event.is_buy && event.user === coin.creator) {
           coin.creatorBuyLamports += amount;
         }
+        const tradePrice = priceOf(BigInt(event.virtual_quote_reserves), BigInt(event.virtual_token_reserves));
+        if (tradePrice > coin.peakPrice) coin.peakPrice = tradePrice;
         const last = coin.flows[coin.flows.length - 1];
         if (last !== undefined && last.slot === event.slot) {
           if (event.is_buy) last.buy += amount;
@@ -157,12 +162,27 @@ function noteEvents(state: BotState, batch: Batch): Map<string, { buy: bigint; s
 
 function noteFills(state: BotState, batch: Batch): void {
   for (const fill of batch.fills) {
-    if (fill.status !== "filled" || fill.side !== "buy") continue;
     const coin = coins.get(fill.mint);
-    if (coin !== undefined) {
+    if (coin === undefined) continue;
+    if (fill.status === "filled" && fill.side === "buy") {
       coin.investedLamports += BigInt(fill.quote_lamports);
     }
+    if (fill.status === "rejected" && fill.side === "sell") {
+      // A sell the harness refused (dust, slippage, or too many tokens for
+      // what we still hold): do not hammer it again next batch.
+      coin.lastSellRejectSlot = batch.slot;
+    }
   }
+}
+
+// A sell whose proceeds would not cover the transaction fee is dust: the
+// harness rejects it as zero_amount, so sending it every batch only adds
+// rejected orders. Value is tokens times the current price in lamports.
+function sellIsDust(state: BotState, mint: string, tokenAmount: bigint, price: number): boolean {
+  if (price <= 0) return true;
+  const value = Number(tokenAmount) * price;
+  const txFee = Number(state.txFeeLamports());
+  return value * 0.9875 - txFee <= 0;
 }
 
 function decideExits(state: BotState, batch: Batch, orders: OrderInput[]): Set<string> {
@@ -176,10 +196,13 @@ function decideExits(state: BotState, batch: Batch, orders: OrderInput[]): Set<s
     if (coin.peakPrice < price) coin.peakPrice = price;
     const tokens = holding.token_amount;
     if (tokens <= 0n) continue;
+    // A sell refused a few slots ago gets a short cooldown instead of a
+    // retry every batch; the price will have moved by then or not at all.
+    if (batch.slot - coin.lastSellRejectSlot < 10) continue;
 
     if (!coin.tp1Done && price >= (entry * (10000 + TP1_BPS)) / 10000) {
       const amount = (tokens * 40n) / 100n;
-      if (amount > 0n) {
+      if (amount > 0n && !sellIsDust(state, mint, amount, price)) {
         orders.push({ side: "sell", mint, token_amount: amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
         coin.tp1Done = true;
       }
@@ -187,7 +210,7 @@ function decideExits(state: BotState, batch: Batch, orders: OrderInput[]): Set<s
     }
     if (coin.tp1Done && !coin.tp2Done && price >= (entry * (10000 + TP2_BPS)) / 10000) {
       const amount = (tokens * 50n) / 100n;
-      if (amount > 0n) {
+      if (amount > 0n && !sellIsDust(state, mint, amount, price)) {
         orders.push({ side: "sell", mint, token_amount: amount, max_slippage_bps: SELL_SLIPPAGE_BPS });
         coin.tp2Done = true;
       }
@@ -199,8 +222,10 @@ function decideExits(state: BotState, batch: Batch, orders: OrderInput[]): Set<s
       coin.tp1Done && coin.peakPrice > 0 && price <= (coin.peakPrice * (10000 - TRAIL_BPS)) / 10000;
     const timedOut = age > TIMEOUT_SLOTS && price < (entry * 11000) / 10000;
     if (stopHit || trailHit || timedOut) {
-      orders.push({ side: "sell", mint, token_amount: tokens, max_slippage_bps: SELL_SLIPPAGE_BPS });
-      sellingAll.add(mint);
+      if (!sellIsDust(state, mint, tokens, price)) {
+        orders.push({ side: "sell", mint, token_amount: tokens, max_slippage_bps: SELL_SLIPPAGE_BPS });
+        sellingAll.add(mint);
+      }
     }
   }
   return sellingAll;
@@ -243,18 +268,26 @@ function decideProbes(
   batchFlow: Map<string, { buy: bigint; sell: bigint }>,
   orders: OrderInput[],
 ): void {
-  if (state.committedPositionCount() >= state.hello.caps.max_open_positions) return;
+  // Never send more probes in one batch than the free position slots: the
+  // extras would all be rejected for max_open_positions.
+  let freeSlots = state.hello.caps.max_open_positions - state.committedPositionCount();
+  if (freeSlots <= 0) return;
   for (const coin of coins.values()) {
+    if (freeSlots <= 0) return;
     if (coin.probed) continue;
     if (state.positions.has(coin.mint)) continue;
     const curve = state.curves.get(coin.mint);
     if (curve === undefined || curve.complete) continue;
     const age = batch.slot - coin.createdSlot;
-    if (age < 0 || age > PROBE_MAX_AGE_SLOTS) continue;
+    if (age < PROBE_MIN_AGE_SLOTS || age > PROBE_MAX_AGE_SLOTS) continue;
     if (curve.real_quote_reserves < MIN_REAL_RESERVE_LAMPORTS) continue;
-    const flow = batchFlow.get(coin.mint);
-    const batchBuys = flow === undefined ? 0n : flow.buy;
-    if (coin.creatorBuyLamports < CREATOR_PROBE_LAMPORTS && batchBuys < BATCH_PROBE_LAMPORTS) continue;
+    if (coin.createPrice <= 0) continue;
+    // Buy the floor after the spike: the coin ran at least 15% above its
+    // creation price and has since fallen back to within 8% of it.
+    const price = coinPrice(state, coin.mint);
+    if (price <= 0) continue;
+    if (coin.peakPrice < (coin.createPrice * (10000 + SPIKE_MIN_BPS)) / 10000) continue;
+    if (price > (coin.createPrice * (10000 + DUMP_MAX_BPS)) / 10000) continue;
     const cap = state.maxBuyLamports(coin.mint);
     let size = PROBE_LAMPORTS < cap ? PROBE_LAMPORTS : cap;
     const free = state.freeCashLamports() - state.txFeeLamports();
@@ -262,6 +295,7 @@ function decideProbes(
     if (size < PROBE_LAMPORTS) continue;
     orders.push({ side: "buy", mint: coin.mint, quote_lamports: size, max_slippage_bps: BUY_SLIPPAGE_BPS });
     coin.probed = true;
+    freeSlots -= 1;
   }
 }
 
